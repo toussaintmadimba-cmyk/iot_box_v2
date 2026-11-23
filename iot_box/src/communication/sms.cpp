@@ -20,6 +20,7 @@ bool espHmac(const uint8_t key[32], const char* data, size_t length, uint8_t dig
 class NvsStore : public djua::D2Store {
 public:
     bool begin() { open_ = preferences_.begin("djua_d2", false); return open_; }
+    bool clear() { return open_ && preferences_.clear(); }
     djua::ReadResult read(const char* name, void* data, size_t size) override {
         if (!open_) return djua::ReadResult::Error;
         if (!preferences_.isKey(name)) return djua::ReadResult::Missing;
@@ -40,11 +41,53 @@ public:
     HardwareSerial uart{1};
     bool open = false;
     int available() override { return open ? uart.available() : 0; }
-    int read() override { return open ? uart.read() : -1; }
-    bool write(const char* data, size_t size) override {
-        return open && uart.availableForWrite() >= static_cast<int>(size) &&
-            uart.write(reinterpret_cast<const uint8_t*>(data), size) == size;
+    int read() override {
+        if (!open) return -1;
+        const int c = uart.read();
+#if GSM_DEBUG_AT
+        if (c >= 0) logRx(static_cast<char>(c));
+#endif
+        return c;
     }
+    bool write(const char* data, size_t size) override {
+        if (!open || uart.availableForWrite() < static_cast<int>(size)) return false;
+#if GSM_DEBUG_AT
+        logTx(data, size);
+#endif
+        return uart.write(reinterpret_cast<const uint8_t*>(data), size) == size;
+    }
+private:
+#if GSM_DEBUG_AT
+    char rxLog_[192] = {};
+    size_t rxUsed_ = 0;
+    void logRx(char c) {
+        if (c == '>') {
+            Serial.println("[GSM RX] >");
+            rxUsed_ = 0;
+            return;
+        }
+        if (c == '\n') {
+            if (rxUsed_ > 0) {
+                rxLog_[rxUsed_] = 0;
+                Serial.printf("[GSM RX] %s\n", rxLog_);
+                rxUsed_ = 0;
+            }
+            return;
+        }
+        if (c != '\r' && rxUsed_ + 1 < sizeof(rxLog_)) {
+            rxLog_[rxUsed_++] = c;
+        }
+    }
+    static void logTx(const char* data, size_t size) {
+        if (size == 1 && data[0] == 26) { Serial.println("[GSM TX] <CTRL-Z>"); return; }
+        if (size == 1 && data[0] == 27) { Serial.println("[GSM TX] <ESC>"); return; }
+        Serial.print("[GSM TX] ");
+        for (size_t i = 0; i < size; ++i) {
+            if (data[i] != '\r' && data[i] != '\n') Serial.write(data[i]);
+        }
+        Serial.println();
+    }
+#endif
 };
 NvsStore store;
 UartIo io;
@@ -136,7 +179,6 @@ void updateProvisioning() {
 }
 #endif
 void autoProvisionIfAbsent() {
-    if (journal.state() != djua::D2State::Unprovisioned) return;
     const char* hex = D2_DEFAULT_HMAC_KEY_HEX;
     if (!hex || strlen(hex) != 64) return;
     uint8_t key[32] = {};
@@ -147,15 +189,38 @@ void autoProvisionIfAbsent() {
         if (digit < 0) { memset(key, 0, sizeof(key)); return; }
         key[i / 2] = static_cast<uint8_t>((key[i / 2] << 4) | digit);
     }
-    const bool ok = journal.provision(DEVICE_ID, key, D2_DEFAULT_RECEIVER, "firmware-default", 1);
+    if (journal.state() == djua::D2State::Ready &&
+        strcmp(journal.identity().device, DEVICE_ID) == 0 &&
+        memcmp(journal.identity().key, key, 32) == 0 &&
+        strcmp(journal.identity().receiver, D2_DEFAULT_RECEIVER) == 0) {
+        memset(key, 0, sizeof(key));
+        return;
+    }
+    uint64_t initial = 1;
+    djua::D2Sequence previousSeq{};
+    if (store.read("sequence", &previousSeq, sizeof(previousSeq)) == djua::ReadResult::Ok &&
+        previousSeq.next >= 1 && previousSeq.next <= UINT32_MAX - 256) {
+        initial = previousSeq.next;
+    }
+    if (journal.state() != djua::D2State::Unprovisioned) {
+        Serial.println("[D2] Cle/config NVS differente ou ancienne detectee : resynchronisation NVS...");
+        store.clear();
+        journal.begin();
+    }
+    const bool ok = journal.provision(DEVICE_ID, key, D2_DEFAULT_RECEIVER, "firmware-default", initial);
     memset(key, 0, sizeof(key));
-    Serial.println(ok ? "[D2] Provisionnement auto NVS OK" : "[D2] Provisionnement auto NVS REFUSE");
+    Serial.printf(ok ? "[D2] Provisionnement auto NVS OK | id=%s | dest=%s | seq=%lu\n"
+                     : "[D2] Provisionnement auto NVS REFUSE | id=%s | dest=%s | seq=%lu\n",
+                  DEVICE_ID, D2_DEFAULT_RECEIVER, static_cast<unsigned long>(initial));
 }
 }
 void initSMS() {
     store.begin(); journal.begin();
     autoProvisionIfAbsent();
-    Serial.printf("[D2] reference=%s | etat=%s\n", D2_REFERENCE_SHA, djua::d2StateName(journal.state()));
+    Serial.printf("[D2] reference=%s | etat=%s | id=%s | dest=%s | file=%u\n",
+        D2_REFERENCE_SHA, djua::d2StateName(journal.state()),
+        journal.identity().device, journal.identity().receiver,
+        static_cast<unsigned>(journal.count()));
 #if GSM_HARDWARE_CONFIGURED
     io.uart.setRxBufferSize(512);
     io.uart.setTxBufferSize(256);
@@ -178,7 +243,12 @@ void initSMS() {
 #endif
 }
 bool enqueueSMS(djua::D2Frame frame) {
-    djua::D2Error error; const auto result = journal.enqueue(frame, error);
+    djua::D2Error error;
+    auto result = journal.enqueue(frame, error);
+    if (result == djua::EnqueueResult::Full && !frame.event && scheduler.evictOldestPeriodic()) {
+        Serial.println("[D2] File periodique pleine (4/4) : plus ancien SMS remplace par la nouvelle mesure");
+        result = journal.enqueue(frame, error);
+    }
     if (result != djua::EnqueueResult::Stored) {
         queueFault = true;
         Serial.printf("[D2] MESSAGE NON CREE | resultat=%u | %s | %s | file=%u\n",
@@ -204,17 +274,66 @@ void updateSMS() {
 #endif
         if (startup.ready()) { modem.begin(true, now); modemStarted = true; }
     }
+    static bool wasReady = false;
+    static int lastActive = -1;
     scheduler.update(now);
+    if (modem.ready() != wasReady) {
+        wasReady = modem.ready();
+        if (wasReady) {
+            Serial.printf("[GSM] MODEM PRET | module=%s | reseau=OK | file=%u\n",
+                GSM_MODULE_LABEL, static_cast<unsigned>(journal.count()));
+        }
+    }
+    if (scheduler.activeIndex() != lastActive) {
+        lastActive = scheduler.activeIndex();
+        if (lastActive >= 0) {
+            const auto* item = journal.at(static_cast<size_t>(lastActive));
+            if (item) {
+                Serial.printf("[SMS] Envoi en cours vers %s | seq=%lu | tentative=%lu | file=%u\n",
+                    journal.identity().receiver,
+                    static_cast<unsigned long>(item->sequence),
+                    static_cast<unsigned long>(item->attempts),
+                    static_cast<unsigned>(journal.count()));
+            }
+        }
+    }
+    const auto faultReason = [](djua::GsmFault fault) -> const char* {
+        switch (fault) {
+        case djua::GsmFault::SimNotReady: return "SIM ABSENTE/VERROUILLEE (PIN/PUK)";
+        case djua::GsmFault::SmsUnsupported: return "SERVICE SMS MO NON DISPONIBLE";
+        case djua::GsmFault::ServiceCentreMissing: return "CENTRE SMS NON CONFIGURE";
+        case djua::GsmFault::NotRegistered: return "RESEAU NON ENREGISTRE";
+        case djua::GsmFault::SubmitTimeout: return "CMGS INCERTAIN/TIMEOUT";
+        case djua::GsmFault::PromptTimeout: return "COMMANDE/PROMPT TIMEOUT (MODEM MUET?)";
+        case djua::GsmFault::WriteError: return "ERREUR ECRITURE UART";
+        case djua::GsmFault::LineTooLong: return "LIGNE AT TROP LONGUE";
+        case djua::GsmFault::UnexpectedOk: return "OK INATTENDU SANS +CMGS";
+        case djua::GsmFault::None: return "AUCUN DEFAUT";
+        default: return "ERREUR AT/CMS/CME";
+        }
+    };
+    const auto stateName = [](djua::GsmState st) -> const char* {
+        switch (st) {
+        case djua::GsmState::Disabled: return "DESACTIVE";
+        case djua::GsmState::Backoff: return "ATTENTE_RETRY";
+        case djua::GsmState::Initializing: return "INIT_AT";
+        case djua::GsmState::Ready: return "PRET";
+        case djua::GsmState::Prompt: return "ATTENTE_PROMPT";
+        case djua::GsmState::Submitting: return "ENVOI_CMGS";
+        }
+        return "INCONNU";
+    };
     if (lastModemFault != modem.fault()) {
         lastModemFault = modem.fault();
-        const char* reason = lastModemFault == djua::GsmFault::SimNotReady ? "SIM ABSENTE/VERROUILLEE (PIN/PUK)" :
-            lastModemFault == djua::GsmFault::SmsUnsupported ? "SERVICE SMS MO NON DISPONIBLE" :
-            lastModemFault == djua::GsmFault::ServiceCentreMissing ? "CENTRE SMS NON CONFIGURE" :
-            lastModemFault == djua::GsmFault::NotRegistered ? "RESEAU NON ENREGISTRE" :
-            lastModemFault == djua::GsmFault::SubmitTimeout ? "CMGS INCERTAIN/TIMEOUT" :
-            lastModemFault == djua::GsmFault::PromptTimeout ? "COMMANDE/PROMPT TIMEOUT" :
-            lastModemFault == djua::GsmFault::None ? "MODEM PRET" : "ERREUR AT/UART";
-        Serial.printf("[GSM] %s | code_erreur=%d\n", reason, modem.errorCode());
+        Serial.printf("[GSM] %s | code_erreur=%d\n", faultReason(lastModemFault), modem.errorCode());
+    }
+    static uint32_t lastGsmDiag = 0;
+    if (io.open && now - lastGsmDiag >= 15000UL && (!modem.ready() || journal.count() > 0)) {
+        lastGsmDiag = now;
+        Serial.printf("[GSM] Etat=%s | defaut=%s | code=%d | reseau=%u | sms_cfg=%u | file=%u\n",
+            stateName(modem.state()), faultReason(modem.fault()), modem.errorCode(),
+            modem.registered() ? 1U : 0U, modem.smsConfigured() ? 1U : 0U,
+            static_cast<unsigned>(journal.count()));
     }
     const auto result = scheduler.takeResult();
     if (result != djua::GsmResult::None) {

@@ -39,6 +39,9 @@ static_assert(D2_PERIOD_SECONDS >= 10UL && D2_PERIOD_SECONDS <= 86400UL,
 #ifndef GSM_MODULE_LABEL
 #define GSM_MODULE_LABEL "SIM800C"
 #endif
+#ifndef GSM_DEBUG_AT
+#define GSM_DEBUG_AT 1
+#endif
 // PWRKEY optionnel via transistor : niveau actif cote ESP32, pas cote module.
 #ifndef GSM_PWRKEY_ACTIVE_LEVEL
 #define GSM_PWRKEY_ACTIVE_LEVEL 0
@@ -47,9 +50,9 @@ static_assert(D2_PERIOD_SECONDS >= 10UL && D2_PERIOD_SECONDS <= 86400UL,
 #define GSM_PWRKEY_PULSE_MS 1200UL
 #define GSM_BOOT_WAIT_MS 5000UL
 #define GSM_COMMAND_TIMEOUT_MS 10000UL
-#define GSM_SUBMIT_TIMEOUT_MS 120000UL
-#define GSM_RETRY_INTERVAL_MS 30000UL
-#define SMS_RETRY_MAX_MS 900000UL
+#define GSM_SUBMIT_TIMEOUT_MS 35000UL
+#define GSM_RETRY_INTERVAL_MS 15000UL
+#define SMS_RETRY_MAX_MS 60000UL
 static_assert(GSM_COMMAND_TIMEOUT_MS > 0 && GSM_SUBMIT_TIMEOUT_MS > 0 &&
               GSM_RETRY_INTERVAL_MS > 0 && SMS_RETRY_MAX_MS >= GSM_RETRY_INTERVAL_MS,
               "Les temporisations GSM/SMS doivent etre positives et coherentes");

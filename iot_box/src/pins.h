@@ -39,6 +39,8 @@
 // Verifier les niveaux de la carte A7670.
 // UART2 GPIO16/17 reste au GPS.
 // Aucun PWRKEY n'est suppose par le firmware.
+// VCC - GND - 13 - 32
+ 
 #ifndef GSM_RX_PIN
 #define GSM_RX_PIN 32
 #endif

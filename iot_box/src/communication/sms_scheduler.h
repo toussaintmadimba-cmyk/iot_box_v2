@@ -9,6 +9,20 @@ public:
         : journal_(journal), modem_(modem), retryBase_(retryBase), retryMax_(retryMax) {}
     void update(uint32_t now);
     GsmResult takeResult() { auto result = result_; result_ = GsmResult::None; return result; }
+    int activeIndex() const { return active_; }
+    bool evictOldestPeriodic() {
+        for (size_t i = 0; i < journal_.count(); ++i) {
+            const auto* item = journal_.at(i);
+            if (!item || item->urgent || static_cast<int>(i) == active_) continue;
+            const uint32_t evictedSeq = item->sequence;
+            if (!journal_.acceptedByModem(i)) return false;
+            for (size_t slot = 0; slot < D2_QUEUE_CAPACITY; ++slot)
+                if (failedSequence_[slot] == evictedSeq) failedSequence_[slot] = 0;
+            if (active_ > static_cast<int>(i)) --active_;
+            return true;
+        }
+        return false;
+    }
     static uint32_t retryDelay(uint32_t attempts, uint32_t base = 30000, uint32_t maximum = 900000);
 private:
     D2Journal& journal_;

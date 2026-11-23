@@ -141,6 +141,7 @@ void GsmEngine::update(uint32_t now) {
             if (!io_.write(payload_, strlen(payload_)) || !io_.write(&ctrlZ, 1)) fail(now, GsmFault::WriteError);
         } else if (c == '\n') { if (used_) line(now); }
         else if (c != '\r') {
+            if (used_ == 0 && c == ' ' && state_ == GsmState::Submitting) continue;
             if (used_ + 1 >= sizeof(line_)) { fail(now, GsmFault::LineTooLong); break; }
             line_[used_++] = c;
         }
